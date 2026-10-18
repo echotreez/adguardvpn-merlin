@@ -811,9 +811,27 @@ hook_del() {
 hook_add() {
     hf="/jffs/scripts/$1"
     [ -f "$hf" ] || printf '#!/bin/sh\n' > "$hf"
-    chmod a+rx "$hf"
     hook_del "$1"
-    printf '### %s start\n%s\n### %s end\n' "$NAME" "$2" "$NAME" >> "$hf"
+    hb=$(printf '### %s start\n%s\n### %s end' "$NAME" "$2" "$NAME")
+    {
+        if head -n 1 "$hf" | grep -q '^#!'; then
+            head -n 1 "$hf"
+            printf '%s\n' "$hb"
+            tail -n +2 "$hf"
+        else
+            printf '%s\n' "$hb"
+            cat "$hf"
+        fi
+    } > "$hf.tmp"
+    cat "$hf.tmp" > "$hf"
+    rm -f "$hf.tmp"
+    chmod a+rx "$hf"
+}
+
+hook_conflicts() {
+    if [ -f /jffs/scripts/wan-event ] && sed "/^### $NAME start\$/,/^### $NAME end\$/d" /jffs/scripts/wan-event | grep -qE 'adguardvpn-cli connect|ADGUARD_FORWARD'; then
+        warn "/jffs/scripts/wan-event still contains the official AdGuard block (connect / ADGUARD_FORWARD). Remove it, otherwise it starts a full-tunnel connection"
+    fi
 }
 
 hooks_install() {
@@ -846,6 +864,7 @@ do_install() {
     [ -f "$NETS" ] || printf '# optional static IPv4 addresses or CIDRs to route through the VPN\n' > "$NETS"
     [ -f "$SRCS" ] || printf '# optional LAN client IPs/CIDRs; empty means all LAN clients\n' > "$SRCS"
     hooks_install
+    hook_conflicts
     load_conf
     sets_create
     ok "Installed $NAME $VERSION"
