@@ -13,10 +13,10 @@
 
 ## 安装
 
-在 Mac 上：
+在 client 上：
 
 ```sh
-scp ~/Documents/config/network/adguardvpn/adguardvpn admin@<router-ip>:/jffs/scripts/adguardvpn
+scp ~/adguardvpn admin@<router-ip>:/jffs/scripts/adguardvpn
 ```
 
 在 router 上（SSH）：
