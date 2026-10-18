@@ -1,0 +1,1246 @@
+#!/bin/sh
+NAME="adguardvpn"
+VERSION="1.0.0"
+SCRIPT_PATH="/jffs/scripts/$NAME"
+ADDON_DIR="/jffs/addons/${NAME}.d"
+CONF="$ADDON_DIR/${NAME}.conf"
+DOMAINS="$ADDON_DIR/domains.list"
+NETS="$ADDON_DIR/ips.list"
+SRCS="$ADDON_DIR/sources.list"
+STATE="$ADDON_DIR/enabled"
+LOCK="/tmp/${NAME}.lock"
+LASTTRY="/tmp/${NAME}.lasttry"
+SET_DOM="AGVPN_DOM"
+SET_DOM6="AGVPN_DOM6"
+SET_NET="AGVPN_NET"
+CH_MARK="AGVPN_MARK"
+CH_OUT="AGVPN_OUT"
+CH_MSS="AGVPN_MSS"
+CH_FWD="AGVPN_FWD"
+CH_FWD6="AGVPN_FWD6"
+CH_NAT="AGVPN_NAT"
+INSTALL_URL_DEFAULT="https://raw.githubusercontent.com/AdguardTeam/AdGuardVPNCLI/master/scripts/release/install.sh"
+
+RED='\033[1;31m'
+GRN='\033[1;32m'
+YLW='\033[1;33m'
+CYN='\033[1;36m'
+CLR='\033[0m'
+
+say() { printf '%b\n' "$*"; }
+ok() { printf '%b\n' "${GRN}$*${CLR}"; }
+warn() { printf '%b\n' "${YLW}$*${CLR}" >&2; }
+err() { printf '%b\n' "${RED}$*${CLR}" >&2; }
+log() { logger -t "$NAME" "$*"; }
+
+load_conf() {
+    AGVPN_IFACE="tun0"
+    AGVPN_TABLE="1893"
+    AGVPN_PRIO="9890"
+    AGVPN_MARK="0x2000000"
+    AGVPN_MASK="0x2000000"
+    AGVPN_LAN="br+"
+    AGVPN_KILLSWITCH="0"
+    AGVPN_IPV6="block"
+    AGVPN_DNS=""
+    AGVPN_HOME="/opt/home/admin"
+    AGVPN_CLI=""
+    AGVPN_LOCATION=""
+    AGVPN_FASTEST="0"
+    AGVPN_IPONLY=""
+    AGVPN_TIMEOUT="86400"
+    AGVPN_WATCHDOG="1"
+    AGVPN_INSTALL_URL="$INSTALL_URL_DEFAULT"
+    AGVPN_UPDATE_URL=""
+    [ -f "$CONF" ] && . "$CONF"
+    return 0
+}
+
+conf_set() {
+    case "$2" in
+        *\"* | *\$* | *\`* | *\\*)
+            err "Invalid characters in value"
+            return 1
+            ;;
+    esac
+    mkdir -p "$ADDON_DIR"
+    touch "$CONF"
+    grep -v "^$1=" "$CONF" > "$CONF.tmp"
+    printf '%s="%s"\n' "$1" "$2" >> "$CONF.tmp"
+    mv "$CONF.tmp" "$CONF"
+}
+
+lock() {
+    if mkdir "$LOCK" 2>/dev/null; then
+        echo $$ > "$LOCK/pid"
+        return 0
+    fi
+    lp=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$lp" ] && [ "$lp" != "$$" ] && kill -0 "$lp" 2>/dev/null; then
+        return 1
+    fi
+    rm -rf "$LOCK"
+    mkdir "$LOCK" 2>/dev/null || return 1
+    echo $$ > "$LOCK/pid"
+    return 0
+}
+
+unlock() {
+    rm -rf "$LOCK"
+}
+
+mods() {
+    for m in "$@"; do
+        modprobe "$m" 2>/dev/null
+    done
+    return 0
+}
+
+cli_bin() {
+    for p in "$AGVPN_CLI" /opt/adguardvpn_cli/adguardvpn-cli /opt/bin/adguardvpn-cli /usr/local/bin/adguardvpn-cli; do
+        if [ -n "$p" ] && [ -x "$p" ]; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+cli_env() {
+    HOME="$AGVPN_HOME"
+    SSL_CERT_FILE="/opt/etc/ssl/certs/ca-certificates.crt"
+    export HOME SSL_CERT_FILE
+    mkdir -p "$HOME" 2>/dev/null
+    mods tun
+}
+
+agcli() {
+    cb=$(cli_bin) || {
+        err "adguardvpn-cli not found. Run: $NAME cli-install"
+        return 127
+    }
+    cli_env
+    "$cb" "$@"
+}
+
+enforce_cli_config() {
+    agcli config set-mode TUN > /dev/null 2>&1
+    agcli config set-tun-routing-mode NONE > /dev/null 2>&1
+    agcli config set-change-system-dns off > /dev/null 2>&1
+    agcli config set-show-hints off > /dev/null 2>&1
+    agcli config set-show-notifications off > /dev/null 2>&1
+    return 0
+}
+
+detect_iface() {
+    if [ -n "$AGVPN_IFACE" ] && [ "$AGVPN_IFACE" != "auto" ]; then
+        echo "$AGVPN_IFACE"
+        return 0
+    fi
+    for i in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E '^tun[0-9]+$'); do
+        case "$i" in
+            tun1[1-5] | tun2[1-5]) continue ;;
+        esac
+        echo "$i"
+        return 0
+    done
+    return 1
+}
+
+iface_up() {
+    [ -n "$1" ] && ip link show "$1" 2>/dev/null | grep -q '<[^>]*UP'
+}
+
+iface_has_v4() {
+    ip -4 addr show dev "$1" 2>/dev/null | grep -q 'inet '
+}
+
+wait_net() {
+    n=0
+    while [ "$n" -lt "$1" ]; do
+        ping -c1 -W2 1.1.1.1 > /dev/null 2>&1 && return 0
+        ping -c1 -W2 8.8.8.8 > /dev/null 2>&1 && return 0
+        sleep 3
+        n=$((n + 3))
+    done
+    return 1
+}
+
+list_domains() {
+    [ -f "$DOMAINS" ] || return 0
+    sed 's/#.*//' "$DOMAINS" | tr 'A-Z' 'a-z' | tr -d ' \t\r' | sed 's#^[a-z0-9+.-]*://##; s#/.*##; s#:[0-9]*$##; s#^\*\.##; s#^\.##' | grep -E '^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$' | sort -u
+}
+
+list_nets() {
+    [ -f "$NETS" ] || return 0
+    sed 's/#.*//' "$NETS" | tr -d ' \t\r' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'
+}
+
+list_srcs() {
+    [ -f "$SRCS" ] || return 0
+    sed 's/#.*//' "$SRCS" | tr -d ' \t\r' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$'
+}
+
+norm_domain() {
+    echo "$1" | tr 'A-Z' 'a-z' | sed 's#^[a-z0-9+.-]*://##; s#/.*##; s#:[0-9]*$##; s#^\*\.##; s#^\.##'
+}
+
+valid_domain() {
+    echo "$1" | grep -Eq '^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+}
+
+sets_create() {
+    mods ip_set ip_set_hash_ip ip_set_hash_net xt_set
+    st=""
+    if [ "$AGVPN_TIMEOUT" -gt 0 ] 2>/dev/null; then
+        st="timeout $AGVPN_TIMEOUT"
+    fi
+    ipset create -exist "$SET_DOM" hash:ip family inet hashsize 1024 maxelem 65536 $st 2>/dev/null
+    ipset create -exist "$SET_DOM6" hash:ip family inet6 hashsize 1024 maxelem 65536 $st 2>/dev/null
+    ipset create -exist "$SET_NET" hash:net family inet hashsize 256 maxelem 65536 2>/dev/null
+    return 0
+}
+
+sets_load_nets() {
+    ipset flush "$SET_NET" 2>/dev/null
+    list_nets | while read -r n; do
+        ipset add -exist "$SET_NET" "$n" 2>/dev/null
+    done
+    if [ -n "$AGVPN_DNS" ]; then
+        ipset add -exist "$SET_NET" "$AGVPN_DNS" 2>/dev/null
+    fi
+    return 0
+}
+
+sets_destroy() {
+    for s in "$SET_DOM" "$SET_DOM6" "$SET_NET"; do
+        ipset destroy "$s" 2>/dev/null
+    done
+    return 0
+}
+
+dnsmasq_conf() {
+    cfg="$1"
+    [ -n "$cfg" ] && [ -f "$cfg" ] || return 0
+    load_conf
+    sets_create
+    sets_load_nets
+    sed -i '/# agvpn$/d' "$cfg"
+    tg="$SET_DOM"
+    [ "$AGVPN_IPV6" = "block" ] && tg="$SET_DOM,$SET_DOM6"
+    list_domains | while read -r d; do
+        echo "ipset=/$d/$tg # agvpn" >> "$cfg"
+        if [ -n "$AGVPN_DNS" ]; then
+            echo "server=/$d/$AGVPN_DNS # agvpn" >> "$cfg"
+        fi
+    done
+    return 0
+}
+
+chain_reset() {
+    cb="$1"
+    ct="$2"
+    cp="$3"
+    cc="$4"
+    $cb -t "$ct" -S "$cp" 2>/dev/null | grep -- "-j $cc\$" | sed 's/^-A/-D/' | while read -r r; do
+        $cb -t "$ct" $r
+    done
+    $cb -t "$ct" -F "$cc" 2>/dev/null
+    $cb -t "$ct" -X "$cc" 2>/dev/null
+    return 0
+}
+
+chain_new() {
+    cb="$1"
+    ct="$2"
+    cp="$3"
+    cc="$4"
+    shift 4
+    $cb -t "$ct" -N "$cc" 2>/dev/null
+    $cb -t "$ct" -I "$cp" "$@" -j "$cc"
+}
+
+fw_remove() {
+    chain_reset iptables mangle PREROUTING "$CH_MARK"
+    chain_reset iptables mangle OUTPUT "$CH_OUT"
+    chain_reset iptables mangle FORWARD "$CH_MSS"
+    chain_reset iptables filter FORWARD "$CH_FWD"
+    chain_reset iptables nat POSTROUTING "$CH_NAT"
+    if command -v ip6tables > /dev/null 2>&1; then
+        chain_reset ip6tables filter FORWARD "$CH_FWD6"
+    fi
+    return 0
+}
+
+fw_lock() {
+    n=0
+    while ! mkdir "$LOCK.fw" 2>/dev/null; do
+        fp=$(cat "$LOCK.fw/pid" 2>/dev/null)
+        if [ -z "$fp" ] || ! kill -0 "$fp" 2>/dev/null; then
+            rm -rf "$LOCK.fw"
+            continue
+        fi
+        n=$((n + 1))
+        [ "$n" -ge 20 ] && return 1
+        sleep 1
+    done
+    echo $$ > "$LOCK.fw/pid"
+    return 0
+}
+
+fw_unlock() {
+    rm -rf "$LOCK.fw"
+}
+
+fw_apply() {
+    fw_lock || return 1
+    fw_apply_locked
+    fr=$?
+    fw_unlock
+    return $fr
+}
+
+fw_apply_locked() {
+    load_conf
+    [ -f "$STATE" ] || return 0
+    IFN=$(detect_iface)
+    [ -n "$IFN" ] || IFN="$AGVPN_IFACE"
+    MK="$AGVPN_MARK/$AGVPN_MASK"
+    sets_create
+    sets_load_nets
+    mods xt_set xt_mark xt_MARK xt_CONNMARK xt_conntrack xt_TCPMSS
+    fw_remove
+
+    iptables -t mangle -N "$CH_MARK" 2>/dev/null
+    iptables -t mangle -A "$CH_MARK" -j CONNMARK --restore-mark --nfmask "$AGVPN_MASK" --ctmask "$AGVPN_MASK"
+    iptables -t mangle -A "$CH_MARK" -m mark --mark "$MK" -j RETURN
+    srcs=$(list_srcs)
+    if [ -n "$srcs" ]; then
+        for s in $srcs; do
+            for st in "$SET_DOM" "$SET_NET"; do
+                iptables -t mangle -A "$CH_MARK" -s "$s" -m conntrack --ctstate NEW -m set --match-set "$st" dst -j MARK --set-xmark "$MK"
+            done
+        done
+    else
+        for st in "$SET_DOM" "$SET_NET"; do
+            iptables -t mangle -A "$CH_MARK" -m conntrack --ctstate NEW -m set --match-set "$st" dst -j MARK --set-xmark "$MK"
+        done
+    fi
+    iptables -t mangle -A "$CH_MARK" -m mark --mark "$MK" -j CONNMARK --save-mark --nfmask "$AGVPN_MASK" --ctmask "$AGVPN_MASK"
+    iptables -t mangle -I PREROUTING -i "$AGVPN_LAN" -j "$CH_MARK"
+
+    if [ -n "$AGVPN_DNS" ]; then
+        iptables -t mangle -N "$CH_OUT" 2>/dev/null
+        iptables -t mangle -A "$CH_OUT" -m set --match-set "$SET_NET" dst -j MARK --set-xmark "$MK"
+        iptables -t mangle -I OUTPUT -j "$CH_OUT"
+    fi
+
+    iptables -t mangle -N "$CH_MSS" 2>/dev/null
+    iptables -t mangle -A "$CH_MSS" -o "$IFN" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    iptables -t mangle -I FORWARD -j "$CH_MSS"
+
+    iptables -t filter -N "$CH_FWD" 2>/dev/null
+    iptables -t filter -A "$CH_FWD" -i "$AGVPN_LAN" -o "$IFN" -j ACCEPT
+    iptables -t filter -A "$CH_FWD" -i "$IFN" -o "$AGVPN_LAN" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    iptables -t filter -I FORWARD -j "$CH_FWD"
+
+    iptables -t nat -N "$CH_NAT" 2>/dev/null
+    iptables -t nat -A "$CH_NAT" -j MASQUERADE
+    iptables -t nat -I POSTROUTING -o "$IFN" -j "$CH_NAT"
+
+    if [ "$AGVPN_IPV6" = "block" ] && command -v ip6tables > /dev/null 2>&1 && [ -f /proc/net/if_inet6 ]; then
+        ip6tables -t filter -N "$CH_FWD6" 2>/dev/null
+        ip6tables -t filter -A "$CH_FWD6" -m set --match-set "$SET_DOM6" dst -j REJECT --reject-with icmp6-adm-prohibited
+        ip6tables -t filter -I FORWARD -i "$AGVPN_LAN" -j "$CH_FWD6"
+    fi
+    return 0
+}
+
+fw_check() {
+    iptables -t mangle -S "$CH_MARK" > /dev/null 2>&1 && iptables -t nat -S "$CH_NAT" > /dev/null 2>&1 && iptables -t filter -S "$CH_FWD" > /dev/null 2>&1
+}
+
+rt_remove() {
+    load_conf
+    for p in $(ip rule show 2>/dev/null | awk -v t="$AGVPN_TABLE" '$NF == t {sub(":", "", $1); print $1}'); do
+        ip rule del priority "$p" 2>/dev/null
+    done
+    ip route flush table "$AGVPN_TABLE" 2>/dev/null
+    ip route flush cache 2>/dev/null
+    return 0
+}
+
+rt_apply() {
+    load_conf
+    [ -f "$STATE" ] || return 0
+    IFN=$(detect_iface)
+    rt_remove
+    ip rule add fwmark "$AGVPN_MARK/$AGVPN_MASK" lookup "$AGVPN_TABLE" priority "$AGVPN_PRIO"
+    if [ -n "$IFN" ] && iface_up "$IFN"; then
+        ip route add default dev "$IFN" table "$AGVPN_TABLE" metric 10
+        echo 2 > "/proc/sys/net/ipv4/conf/$IFN/rp_filter" 2>/dev/null
+    fi
+    if [ "$AGVPN_KILLSWITCH" = "1" ]; then
+        ip route add blackhole default table "$AGVPN_TABLE" metric 100
+    fi
+    ip route flush cache 2>/dev/null
+    return 0
+}
+
+rt_check() {
+    IFN=$(detect_iface)
+    ip rule show 2>/dev/null | grep -q "lookup $AGVPN_TABLE\$" || return 1
+    if [ -n "$IFN" ] && iface_up "$IFN"; then
+        ip route show table "$AGVPN_TABLE" 2>/dev/null | grep -q "default dev $IFN" || return 1
+    fi
+    return 0
+}
+
+cron_add() {
+    command -v cru > /dev/null 2>&1 || return 0
+    if [ "$AGVPN_WATCHDOG" = "1" ]; then
+        cru a "$NAME" "*/1 * * * * $SCRIPT_PATH watchdog"
+    else
+        cru d "$NAME" 2>/dev/null
+    fi
+}
+
+cron_del() {
+    command -v cru > /dev/null 2>&1 && cru d "$NAME" 2>/dev/null
+    return 0
+}
+
+iface_ready() {
+    IFN=$(detect_iface)
+    iface_up "$IFN"
+}
+
+run_connect() {
+    set -- connect -y
+    if [ -n "$AGVPN_LOCATION" ]; then
+        set -- "$@" -l "$AGVPN_LOCATION"
+    elif [ "$AGVPN_FASTEST" = "1" ]; then
+        set -- "$@" -f
+    fi
+    case "$AGVPN_IPONLY" in
+        4) set -- "$@" -4 ;;
+        6) set -- "$@" -6 ;;
+    esac
+    agcli "$@"
+}
+
+bring_up() {
+    if iface_ready; then
+        return 0
+    fi
+    date +%s > "$LASTTRY"
+    cli_bin > /dev/null || {
+        err "adguardvpn-cli not found. Run: $NAME cli-install"
+        return 1
+    }
+    enforce_cli_config
+    ( run_connect > /tmp/${NAME}_connect.log 2>&1 & )
+    n=0
+    while [ "$n" -lt 40 ]; do
+        iface_ready && return 0
+        sleep 2
+        n=$((n + 1))
+    done
+    return 1
+}
+
+do_start() {
+    lock || {
+        warn "Another $NAME operation is running"
+        return 1
+    }
+    start_locked
+    sr=$?
+    unlock
+    return $sr
+}
+
+start_locked() {
+    load_conf
+    mkdir -p "$ADDON_DIR"
+    touch "$STATE"
+    sets_create
+    sets_load_nets
+    if [ -n "$(list_domains)" ] && ! grep -q '# agvpn$' /etc/dnsmasq.conf 2>/dev/null; then
+        service restart_dnsmasq > /dev/null 2>&1
+    fi
+    fw_apply
+    rt_apply
+    cron_add
+    n=0
+    while ! cli_bin > /dev/null && [ "$n" -lt 60 ]; do
+        sleep 2
+        n=$((n + 1))
+    done
+    wait_net 120 || warn "No Internet connectivity detected, trying anyway"
+    if bring_up; then
+        ok "AdGuard VPN tunnel is up"
+    else
+        err "Tunnel did not come up. Check: cat /tmp/${NAME}_connect.log"
+    fi
+    rt_apply
+    fw_apply
+    IFN=$(detect_iface)
+    if iface_up "$IFN" && ! iface_has_v4 "$IFN"; then
+        warn "$IFN has no IPv4 address; MASQUERADE cannot work. Collect: ip addr show $IFN, adguardvpn-cli config show, /tmp/${NAME}_connect.log"
+    fi
+    log "started"
+    return 0
+}
+
+do_stop() {
+    load_conf
+    rm -f "$STATE"
+    agcli disconnect 2>/dev/null
+    rt_remove
+    fw_remove
+    cron_del
+    log "stopped"
+    ok "Stopped. Allow-list traffic now uses the normal WAN path"
+    return 0
+}
+
+do_watchdog() {
+    load_conf
+    [ -f "$STATE" ] || return 0
+    [ "$AGVPN_WATCHDOG" = "1" ] || return 0
+    lock || return 0
+    watchdog_locked
+    unlock
+    return 0
+}
+
+watchdog_locked() {
+    IFN=$(detect_iface)
+    if iface_up "$IFN"; then
+        fw_check || fw_apply
+        rt_check || rt_apply
+        return 0
+    fi
+    rt_check || rt_apply
+    fw_check || fw_apply
+    now=$(date +%s)
+    last=$(cat "$LASTTRY" 2>/dev/null)
+    [ -n "$last" ] || last=0
+    if [ $((now - last)) -ge 120 ] && wait_net 6; then
+        log "tunnel down, reconnecting"
+        bring_up
+        rt_apply
+        fw_apply
+    fi
+    return 0
+}
+
+do_wan() {
+    load_conf
+    [ -f "$STATE" ] || return 0
+    sleep 10
+    if iface_ready; then
+        rt_apply
+        fw_apply
+    else
+        do_start
+    fi
+}
+
+do_postmount() {
+    load_conf
+    [ -f "$STATE" ] || return 0
+    iface_ready && return 0
+    do_start
+}
+
+do_startup() {
+    load_conf
+    [ -f "$STATE" ] || return 0
+    do_start
+}
+
+do_service_event() {
+    load_conf
+    [ "$2" = "$NAME" ] || return 0
+    case "$1" in
+        restart)
+            do_stop
+            do_start
+            ;;
+        start) do_start ;;
+        stop) do_stop ;;
+    esac
+}
+
+do_reload() {
+    load_conf
+    sets_create
+    sets_load_nets
+    fw_apply
+    service restart_dnsmasq > /dev/null 2>&1
+    ok "dnsmasq restarted with $(list_domains | wc -l) domain(s)"
+    ( sleep 5; do_warm ) > /dev/null 2>&1 &
+    return 0
+}
+
+do_warm() {
+    list_domains | while read -r d; do
+        nslookup "$d" 127.0.0.1 > /dev/null 2>&1
+    done
+    return 0
+}
+
+do_test() {
+    load_conf
+    d=$(norm_domain "$1")
+    valid_domain "$d" || {
+        err "Usage: $NAME test <domain>"
+        return 1
+    }
+    ips=$(nslookup "$d" 127.0.0.1 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -v '^127\.' | sort -u)
+    if [ -z "$ips" ]; then
+        err "Could not resolve $d via local dnsmasq"
+        return 1
+    fi
+    if list_domains | grep -qx "$d"; then
+        ok "$d is in the allow list"
+    else
+        parent=$(echo "$d" | sed 's/^[^.]*\.//')
+        if list_domains | grep -qx "$parent"; then
+            ok "$d matches allow-list parent $parent"
+        else
+            warn "$d is not in the allow list"
+        fi
+    fi
+    for ip in $ips; do
+        if ipset test "$SET_DOM" "$ip" > /dev/null 2>&1 || ipset test "$SET_NET" "$ip" > /dev/null 2>&1; then
+            inset="in ipset"
+        else
+            inset="NOT in ipset"
+        fi
+        via=$(ip route get "$ip" mark "$AGVPN_MARK" 2>/dev/null | head -n1)
+        say "$ip  [$inset]"
+        say "   marked route : $via"
+    done
+}
+
+count_set() {
+    ipset list "$1" 2>/dev/null | awk '/Number of entries/ {print $4}'
+}
+
+do_status() {
+    load_conf
+    say "${CYN}$NAME $VERSION${CLR}"
+    if [ -f "$STATE" ]; then ok "Enabled: yes"; else warn "Enabled: no"; fi
+    cb=$(cli_bin) && say "CLI: $cb" || err "CLI: not installed"
+    IFN=$(detect_iface)
+    if iface_up "$IFN"; then
+        ok "Interface: $IFN up"
+        ip -4 addr show dev "$IFN" 2>/dev/null | grep 'inet ' | sed 's/^ */   /'
+        iface_has_v4 "$IFN" || warn "   no IPv4 address on $IFN"
+    else
+        err "Interface: ${IFN:-none} down"
+    fi
+    echo "--- adguardvpn-cli status"
+    agcli status 2>&1 | head -n 20
+    echo "--- policy routing (mark $AGVPN_MARK/$AGVPN_MASK, table $AGVPN_TABLE, prio $AGVPN_PRIO)"
+    ip rule show 2>/dev/null | grep "lookup $AGVPN_TABLE\$" || warn "   ip rule missing"
+    ip route show table "$AGVPN_TABLE" 2>/dev/null | sed 's/^/   /'
+    echo "--- firewall"
+    if fw_check; then ok "   chains present"; else warn "   chains missing"; fi
+    echo "--- allow list"
+    echo "   domains: $(list_domains | wc -l)   static nets: $(list_nets | wc -l)   source limits: $(list_srcs | wc -l)"
+    echo "   ipset $SET_DOM: $(count_set $SET_DOM) entries   $SET_DOM6: $(count_set $SET_DOM6)   $SET_NET: $(count_set $SET_NET)"
+    echo "   kill switch: $AGVPN_KILLSWITCH   ipv6: $AGVPN_IPV6   dns: ${AGVPN_DNS:-none}"
+    grep -q '# agvpn$' /etc/dnsmasq.conf 2>/dev/null && ok "   dnsmasq has ipset rules" || warn "   dnsmasq has no ipset rules (run: $NAME reload)"
+}
+
+check_env() {
+    nvram get rc_support | grep -q am_addons || warn "Firmware does not report am_addons support"
+    if [ "$(nvram get jffs2_scripts)" != "1" ]; then
+        err "JFFS custom scripts are disabled: Administration > System > Enable JFFS custom scripts and configs"
+        return 1
+    fi
+    if [ -x /usr/sbin/dnsmasq ] && ! /usr/sbin/dnsmasq -v 2>&1 | grep -qi 'ipset'; then
+        err "dnsmasq on this firmware has no ipset support"
+        return 1
+    fi
+    if ps w 2>/dev/null | grep -i '[A]dGuardHome' > /dev/null; then
+        warn "AdGuardHome appears to be running; clients must resolve through dnsmasq or the ipset stays empty"
+    fi
+    command -v ipset > /dev/null 2>&1 || {
+        err "ipset binary not found"
+        return 1
+    }
+    return 0
+}
+
+hook_del() {
+    hf="/jffs/scripts/$1"
+    [ -f "$hf" ] || return 0
+    sed -i "/^### $NAME start\$/,/^### $NAME end\$/d" "$hf"
+}
+
+hook_add() {
+    hf="/jffs/scripts/$1"
+    [ -f "$hf" ] || printf '#!/bin/sh\n' > "$hf"
+    chmod a+rx "$hf"
+    hook_del "$1"
+    printf '### %s start\n%s\n### %s end\n' "$NAME" "$2" "$NAME" >> "$hf"
+}
+
+hooks_install() {
+    hook_add services-start "$SCRIPT_PATH startup &"
+    hook_add firewall-start "$SCRIPT_PATH fw"
+    hook_add nat-start "$SCRIPT_PATH fw"
+    hook_add wan-event "if [ \"\$2\" = \"connected\" ]; then $SCRIPT_PATH wan \"\$@\" & fi"
+    hook_add post-mount "$SCRIPT_PATH postmount \"\$@\" &"
+    hook_add service-event "$SCRIPT_PATH service_event \"\$@\" &"
+    hook_add dnsmasq.postconf "$SCRIPT_PATH dnsmasq \"\${CONFIG:-\$1}\""
+}
+
+hooks_remove() {
+    for h in services-start firewall-start nat-start wan-event post-mount service-event dnsmasq.postconf; do
+        hook_del "$h"
+    done
+}
+
+do_install() {
+    check_env || return 1
+    mkdir -p "$ADDON_DIR" /jffs/scripts
+    self=$(readlink -f "$0" 2>/dev/null)
+    if [ "$self" != "$SCRIPT_PATH" ]; then
+        cp "$0" "$SCRIPT_PATH" || return 1
+    fi
+    chmod a+rx "$SCRIPT_PATH"
+    [ -d /opt/bin ] && ln -sf "$SCRIPT_PATH" /opt/bin/$NAME
+    [ -f "$CONF" ] || : > "$CONF"
+    [ -f "$DOMAINS" ] || printf '# one domain per line; subdomains are included automatically\n' > "$DOMAINS"
+    [ -f "$NETS" ] || printf '# optional static IPv4 addresses or CIDRs to route through the VPN\n' > "$NETS"
+    [ -f "$SRCS" ] || printf '# optional LAN client IPs/CIDRs; empty means all LAN clients\n' > "$SRCS"
+    hooks_install
+    load_conf
+    sets_create
+    ok "Installed $NAME $VERSION"
+    cb=$(cli_bin) || warn "adguardvpn-cli not found. Run: $NAME cli-install"
+    say "Next steps:"
+    say "  $NAME cli-install"
+    say "  $NAME login"
+    say "  $NAME domain add example.com"
+    say "  $NAME start"
+}
+
+do_uninstall() {
+    printf 'Remove %s completely? [y/N] ' "$NAME"
+    read -r a
+    case "$a" in y | Y) ;; *) return 0 ;; esac
+    load_conf
+    do_stop
+    hooks_remove
+    sets_destroy
+    service restart_dnsmasq > /dev/null 2>&1
+    rm -f /opt/bin/$NAME
+    printf 'Also delete configuration and lists in %s? [y/N] ' "$ADDON_DIR"
+    read -r a
+    case "$a" in y | Y) rm -rf "$ADDON_DIR" ;; esac
+    rm -f "$SCRIPT_PATH"
+    ok "Uninstalled"
+}
+
+do_cli_install() {
+    load_conf
+    command -v opkg > /dev/null 2>&1 || {
+        err "Entware (opkg) is required. Run amtm and install Entware first"
+        return 1
+    }
+    opkg update
+    opkg install curl ca-certificates
+    cd /opt || return 1
+    curl -fsSL "$AGVPN_INSTALL_URL" -o /opt/tmp/agvpn_install.sh 2>/dev/null || curl -fsSL "$AGVPN_INSTALL_URL" -o /tmp/agvpn_install.sh || return 1
+    ins=/opt/tmp/agvpn_install.sh
+    [ -f "$ins" ] || ins=/tmp/agvpn_install.sh
+    SSL_CERT_FILE=/opt/etc/ssl/certs/ca-certificates.crt sh "$ins" -a n -o /opt -v
+    rm -f "$ins"
+    if [ -x /opt/adguardvpn_cli/adguardvpn-cli ]; then
+        ln -sf /opt/adguardvpn_cli/adguardvpn-cli /opt/bin/adguardvpn-cli
+        mkdir -p "$AGVPN_HOME"
+        enforce_cli_config
+        ok "adguardvpn-cli installed. Next: $NAME login"
+    else
+        err "Installation failed"
+        return 1
+    fi
+}
+
+cmd_connect() {
+    load_conf
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -l | --location)
+                conf_set AGVPN_LOCATION "$2"
+                conf_set AGVPN_FASTEST 0
+                shift
+                ;;
+            -f | --fastest)
+                conf_set AGVPN_FASTEST 1
+                conf_set AGVPN_LOCATION ""
+                ;;
+            -4 | --ipv4only) conf_set AGVPN_IPONLY 4 ;;
+            -6 | --ipv6only) conf_set AGVPN_IPONLY 6 ;;
+            -y | --yes | -v | --verbose | --no-fork) ;;
+            *)
+                err "Unknown connect option: $1"
+                return 1
+                ;;
+        esac
+        shift
+    done
+    if iface_ready; then
+        agcli disconnect > /dev/null 2>&1
+        sleep 2
+    fi
+    load_conf
+    do_start
+}
+
+cmd_login() {
+    if [ ! -t 0 ]; then
+        err "login needs an interactive terminal"
+        return 1
+    fi
+    agcli login
+}
+
+cmd_config() {
+    sub="$1"
+    up=$(echo "$2" | tr 'a-z' 'A-Z')
+    if [ "$AGVPN_FORCE" != "1" ]; then
+        case "$sub" in
+            set-tun-routing-mode)
+                [ "$up" = "NONE" ] || {
+                    err "Refused: this add-on needs tun-routing-mode NONE (AUTO/SCRIPT would hijack the default route). Override with AGVPN_FORCE=1"
+                    return 1
+                }
+                ;;
+            set-change-system-dns)
+                case "$up" in
+                    ON | TRUE | YES | 1)
+                        err "Refused: system DNS takeover would break the router resolver. Override with AGVPN_FORCE=1"
+                        return 1
+                        ;;
+                esac
+                ;;
+            set-mode)
+                [ "$up" = "TUN" ] || {
+                    err "Refused: SOCKS mode does not create a tunnel interface. Override with AGVPN_FORCE=1"
+                    return 1
+                }
+                ;;
+        esac
+    fi
+    agcli config "$@"
+}
+
+cmd_site_exclusions() {
+    warn "Note: site-exclusions act inside the CLI only; forwarded LAN traffic is selected by $NAME domain list"
+    agcli site-exclusions "$@"
+}
+
+cmd_domain() {
+    sub="$1"
+    shift
+    mkdir -p "$ADDON_DIR"
+    touch "$DOMAINS"
+    case "$sub" in
+        add)
+            changed=0
+            for a in "$@"; do
+                d=$(norm_domain "$a")
+                if ! valid_domain "$d"; then
+                    warn "Skipping invalid domain: $a"
+                    continue
+                fi
+                grep -qixF "$d" "$DOMAINS" && continue
+                echo "$d" >> "$DOMAINS"
+                changed=1
+            done
+            [ "$changed" = 1 ] && do_reload
+            ;;
+        remove | rm | del)
+            changed=0
+            for a in "$@"; do
+                d=$(norm_domain "$a")
+                grep -vixF "$d" "$DOMAINS" > "$DOMAINS.tmp"
+                mv "$DOMAINS.tmp" "$DOMAINS"
+                changed=1
+            done
+            [ "$changed" = 1 ] && do_reload
+            ;;
+        list | "") list_domains ;;
+        clear)
+            printf '# one domain per line; subdomains are included automatically\n' > "$DOMAINS"
+            do_reload
+            ;;
+        import)
+            [ -f "$1" ] || {
+                err "File not found: $1"
+                return 1
+            }
+            while read -r l; do
+                d=$(norm_domain "$(echo "$l" | sed 's/#.*//' | tr -d ' \t\r')")
+                valid_domain "$d" && ! grep -qixF "$d" "$DOMAINS" && echo "$d" >> "$DOMAINS"
+            done < "$1"
+            do_reload
+            ;;
+        edit)
+            ${EDITOR:-vi} "$DOMAINS"
+            do_reload
+            ;;
+        *)
+            err "Usage: $NAME domain add|remove|list|clear|import FILE|edit"
+            return 1
+            ;;
+    esac
+}
+
+cmd_listfile() {
+    file="$1"
+    kind="$2"
+    sub="$3"
+    shift 3
+    touch "$file"
+    case "$sub" in
+        add)
+            for a in "$@"; do
+                echo "$a" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' || {
+                    warn "Skipping invalid $kind: $a"
+                    continue
+                }
+                grep -qxF "$a" "$file" || echo "$a" >> "$file"
+            done
+            ;;
+        remove | rm | del)
+            for a in "$@"; do
+                grep -vxF "$a" "$file" > "$file.tmp"
+                mv "$file.tmp" "$file"
+            done
+            ;;
+        list | "")
+            sed 's/#.*//' "$file" | grep -v '^[[:space:]]*$'
+            return 0
+            ;;
+        clear) : > "$file" ;;
+        *)
+            err "Usage: $NAME $kind add|remove|list|clear"
+            return 1
+            ;;
+    esac
+    load_conf
+    sets_load_nets
+    fw_apply
+}
+
+cmd_set() {
+    load_conf
+    if [ -z "$1" ]; then
+        for k in iface table prio mark mask lan killswitch ipv6 dns home cli location fastest iponly timeout watchdog install_url update_url; do
+            u=$(echo "$k" | tr 'a-z' 'A-Z')
+            eval "v=\$AGVPN_$u"
+            printf '%-12s %s\n' "$k" "$v"
+        done
+        return 0
+    fi
+    k=$(echo "$1" | tr 'a-z' 'A-Z')
+    case "$k" in
+        IFACE | TABLE | PRIO | MARK | MASK | LAN | KILLSWITCH | IPV6 | DNS | HOME | CLI | LOCATION | FASTEST | IPONLY | TIMEOUT | WATCHDOG | INSTALL_URL | UPDATE_URL) ;;
+        *)
+            err "Unknown setting: $1"
+            return 1
+            ;;
+    esac
+    case "$k" in
+        KILLSWITCH | WATCHDOG | FASTEST) case "$2" in 0 | 1) ;; *) err "Value must be 0 or 1"; return 1 ;; esac ;;
+        IPV6) case "$2" in block | ignore) ;; *) err "Value must be block or ignore"; return 1 ;; esac ;;
+        TABLE | PRIO | TIMEOUT) case "$2" in '' | *[!0-9]*) err "Value must be numeric"; return 1 ;; esac ;;
+    esac
+    rt_remove
+    fw_remove
+    conf_set "AGVPN_$k" "$2" || return 1
+    load_conf
+    case "$k" in
+        TIMEOUT)
+            sets_destroy
+            sets_create
+            ;;
+    esac
+    if [ -f "$STATE" ]; then
+        rt_apply
+        fw_apply
+        case "$k" in
+            IPV6 | DNS | TIMEOUT) do_reload ;;
+        esac
+        cron_add
+    fi
+    ok "$1 = $2"
+}
+
+cmd_self_update() {
+    load_conf
+    [ -n "$AGVPN_UPDATE_URL" ] || {
+        err "Set a source first: $NAME set update_url <url>"
+        return 1
+    }
+    curl -fsSL "$AGVPN_UPDATE_URL" -o /tmp/${NAME}.new || return 1
+    sh -n /tmp/${NAME}.new || {
+        err "Downloaded script failed syntax check"
+        return 1
+    }
+    cp /tmp/${NAME}.new "$SCRIPT_PATH"
+    chmod a+rx "$SCRIPT_PATH"
+    rm -f /tmp/${NAME}.new
+    hooks_install
+    ok "Updated"
+}
+
+pause() {
+    printf '\nPress Enter to continue...'
+    read -r _
+}
+
+menu_domains() {
+    while true; do
+        clear
+        say "${CYN}Allow list${CLR}"
+        list_domains | sed 's/^/   /'
+        say ""
+        say " a ) add domain(s)"
+        say " r ) remove domain(s)"
+        say " e ) edit file"
+        say " t ) test a domain"
+        say " w ) warm up (resolve all)"
+        say " b ) back"
+        printf 'Choose: '
+        read -r c
+        case "$c" in
+            a)
+                printf 'Domain(s): '
+                read -r x
+                cmd_domain add $x
+                pause
+                ;;
+            r)
+                printf 'Domain(s): '
+                read -r x
+                cmd_domain remove $x
+                pause
+                ;;
+            e) cmd_domain edit ;;
+            t)
+                printf 'Domain: '
+                read -r x
+                do_test "$x"
+                pause
+                ;;
+            w)
+                do_warm
+                ok "Done"
+                pause
+                ;;
+            b) return 0 ;;
+        esac
+    done
+}
+
+menu_settings() {
+    while true; do
+        clear
+        say "${CYN}Settings${CLR}"
+        cmd_set
+        say ""
+        say " s ) change a setting"
+        say " b ) back"
+        printf 'Choose: '
+        read -r c
+        case "$c" in
+            s)
+                printf 'Name: '
+                read -r k
+                printf 'Value: '
+                read -r v
+                cmd_set "$k" "$v"
+                pause
+                ;;
+            b) return 0 ;;
+        esac
+    done
+}
+
+menu() {
+    while true; do
+        load_conf
+        clear
+        say "${CYN}AdGuard VPN domain routing - $NAME $VERSION${CLR}"
+        iface_ready && ok " Tunnel: up" || warn " Tunnel: down"
+        [ -f "$STATE" ] && ok " Service: enabled" || warn " Service: disabled"
+        say " Domains: $(list_domains | wc -l)"
+        say ""
+        say " 1 ) Status"
+        say " 2 ) Start / reconnect"
+        say " 3 ) Stop"
+        say " 4 ) Login"
+        say " 5 ) Choose location and connect"
+        say " 6 ) Allow-list domains"
+        say " 7 ) Settings"
+        say " 8 ) CLI configuration"
+        say " 9 ) Check / install CLI update"
+        say " l ) Logout"
+        say " i ) Install / update adguardvpn-cli"
+        say " u ) Uninstall"
+        say " e ) Exit"
+        printf 'Choose: '
+        read -r c
+        case "$c" in
+            1)
+                do_status
+                pause
+                ;;
+            2)
+                do_start
+                pause
+                ;;
+            3)
+                do_stop
+                pause
+                ;;
+            4)
+                cmd_login
+                pause
+                ;;
+            5)
+                agcli list-locations 20
+                printf 'Location (city, country or ISO code, empty = fastest): '
+                read -r x
+                if [ -n "$x" ]; then cmd_connect -l "$x"; else cmd_connect -f; fi
+                pause
+                ;;
+            6) menu_domains ;;
+            7) menu_settings ;;
+            8)
+                agcli config show
+                pause
+                ;;
+            9)
+                agcli check-update
+                printf 'Install update now? [y/N] '
+                read -r a
+                case "$a" in y | Y) agcli update -y ;; esac
+                pause
+                ;;
+            l)
+                agcli logout
+                pause
+                ;;
+            i)
+                do_cli_install
+                pause
+                ;;
+            u)
+                do_uninstall
+                pause
+                ;;
+            e | q) return 0 ;;
+        esac
+    done
+}
+
+usage() {
+    cat << EOF
+$NAME $VERSION - AdGuard VPN CLI with domain based routing for Asuswrt-Merlin
+
+Service:
+  install | uninstall | start | stop | restart | status | menu | version
+  cli-install              install adguardvpn-cli through Entware
+  self-update              fetch new script from update_url
+Allow list:
+  domain add|remove|list|clear|import FILE|edit
+  ip add|remove|list|clear         static IPv4/CIDR routed through the VPN
+  src add|remove|list|clear        limit routing to these LAN clients
+  reload | warm | test DOMAIN
+  set [NAME VALUE]                 iface table prio mark mask lan killswitch ipv6 dns home cli
+                                   location fastest iponly timeout watchdog install_url update_url
+adguardvpn-cli commands:
+  login | logout | license | status
+  list-locations [count]
+  connect [-l LOCATION | -f] [-4 | -6] [-y] [-v]
+  disconnect
+  config set-mode|set-dns|set-socks-port|set-socks-host|set-socks-username|set-socks-password
+         clear-socks-auth|set-change-system-dns|set-tun-routing-mode|create-route-script
+         set-crash-reporting|set-update-channel|set-protocol|set-post-quantum|set-show-hints
+         set-debug-logging|set-show-notifications|set-bound-if-override|show
+  site-exclusions add|remove|show|clear|mode
+  check-update | update [-y] [-v] | export-logs [-o PATH] [-f]
+  cli ARGS...                      raw passthrough
+EOF
+}
+
+main() {
+    cmd="$1"
+    [ $# -gt 0 ] && shift
+    case "$cmd" in
+        install) do_install ;;
+        uninstall) do_uninstall ;;
+        start)
+            do_start
+            ;;
+        stop | disconnect) do_stop ;;
+        restart)
+            do_stop
+            do_start
+            ;;
+        status) do_status ;;
+        connect) cmd_connect "$@" ;;
+        login) cmd_login ;;
+        logout) agcli logout ;;
+        license) agcli license ;;
+        list-locations) agcli list-locations "$@" ;;
+        config) cmd_config "$@" ;;
+        site-exclusions) cmd_site_exclusions "$@" ;;
+        check-update) agcli check-update ;;
+        update) agcli update "$@" ;;
+        export-logs) agcli export-logs "$@" ;;
+        cli) agcli "$@" ;;
+        cli-install) do_cli_install ;;
+        self-update) cmd_self_update ;;
+        domain | domains) cmd_domain "$@" ;;
+        ip | ips) cmd_listfile "$NETS" ip "$@" ;;
+        src | source) cmd_listfile "$SRCS" source "$@" ;;
+        reload) do_reload ;;
+        warm) do_warm ;;
+        test) do_test "$1" ;;
+        set) cmd_set "$@" ;;
+        fw)
+            fw_apply
+            rt_check || rt_apply
+            ;;
+        dnsmasq) dnsmasq_conf "$1" ;;
+        watchdog) do_watchdog ;;
+        wan) do_wan ;;
+        postmount) do_postmount ;;
+        startup) do_startup ;;
+        service_event) do_service_event "$@" ;;
+        version | -V) say "$NAME $VERSION" ;;
+        --help-all | -v | --version) agcli "$cmd" ;;
+        menu)
+            menu
+            ;;
+        "")
+            if [ -t 0 ]; then menu; else usage; fi
+            ;;
+        *) usage ;;
+    esac
+}
+
+load_conf
+main "$@"
