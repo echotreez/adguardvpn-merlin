@@ -24,12 +24,9 @@ scp adguardvpn admin@<router-ip>:/jffs/scripts/adguardvpn
 ```sh
 chmod a+rx /jffs/scripts/adguardvpn
 /jffs/scripts/adguardvpn install
-adguardvpn cli-install
-adguardvpn login
-adguardvpn connect -l "Tokyo"
-adguardvpn domain add netflix.com openai.com
-adguardvpn start
 ```
+
+`install` 会按顺序完成整个流程：检查环境、安装 hook、通过 Entware 安装 adguardvpn-cli、登录、选择 location、录入初始域名、启动隧道并输出状态。中途失败后可随时重新运行 `adguardvpn setup` 继续。只想安装 add-on 本身用 `adguardvpn install --no-setup`。
 
 前提：Administration → System 里启用 JFFS custom scripts、SSH；已装 Entware（amtm → `ep`）。
 

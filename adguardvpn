@@ -1,4 +1,6 @@
 #!/bin/sh
+PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export PATH
 NAME="adguardvpn"
 VERSION="1.0.0"
 SCRIPT_PATH="/jffs/scripts/$NAME"
@@ -670,10 +672,15 @@ check_env() {
     if ps w 2>/dev/null | grep -i '[A]dGuardHome' > /dev/null; then
         warn "AdGuardHome appears to be running; clients must resolve through dnsmasq or the ipset stays empty"
     fi
-    command -v ipset > /dev/null 2>&1 || {
+    if [ ! -x /usr/sbin/ipset ] && ! command -v ipset > /dev/null 2>&1; then
         err "ipset binary not found"
         return 1
-    }
+    fi
+    mods ip_set ip_set_hash_ip ip_set_hash_net xt_set
+    if ! ipset list -n > /dev/null 2>&1; then
+        err "ipset exists but the kernel ip_set support is not usable (ipset list -n failed)"
+        return 1
+    fi
     return 0
 }
 
@@ -724,12 +731,86 @@ do_install() {
     load_conf
     sets_create
     ok "Installed $NAME $VERSION"
-    cb=$(cli_bin) || warn "adguardvpn-cli not found. Run: $NAME cli-install"
-    say "Next steps:"
-    say "  $NAME cli-install"
-    say "  $NAME login"
-    say "  $NAME domain add example.com"
-    say "  $NAME start"
+}
+
+is_logged_in() {
+    li=$(agcli list-locations 2>&1)
+    [ $? -eq 0 ] || return 1
+    echo "$li" | grep -qiE 'log in|login|not logged|unauthor' && return 1
+    return 0
+}
+
+do_setup() {
+    load_conf
+    say "${CYN}[1/5] adguardvpn-cli${CLR}"
+    if cli_bin > /dev/null; then
+        ok "already installed: $(cli_bin)"
+    else
+        do_cli_install || return 1
+    fi
+    enforce_cli_config
+
+    say "${CYN}[2/5] account${CLR}"
+    if is_logged_in; then
+        ok "already logged in"
+    else
+        if [ ! -t 0 ]; then
+            err "Not logged in. Run interactively: $NAME setup"
+            return 1
+        fi
+        agcli login
+        is_logged_in || {
+            err "Login did not succeed. Run: $NAME setup"
+            return 1
+        }
+        ok "logged in"
+    fi
+
+    say "${CYN}[3/5] location${CLR}"
+    if [ -z "$AGVPN_LOCATION" ] && [ "$AGVPN_FASTEST" != "1" ]; then
+        if [ -t 0 ]; then
+            agcli list-locations 15
+            printf 'Location (city, country or ISO code; empty = fastest): '
+            read -r x
+            if [ -n "$x" ]; then
+                conf_set AGVPN_LOCATION "$x"
+                conf_set AGVPN_FASTEST 0
+            else
+                conf_set AGVPN_FASTEST 1
+            fi
+        else
+            conf_set AGVPN_FASTEST 1
+        fi
+        load_conf
+    fi
+    ok "location: ${AGVPN_LOCATION:-fastest}"
+
+    say "${CYN}[4/5] allow list${CLR}"
+    if [ -z "$(list_domains)" ] && [ -t 0 ]; then
+        printf 'Domains to route through the VPN (space separated, empty = add later): '
+        read -r xs
+        for a in $xs; do
+            d=$(norm_domain "$a")
+            if valid_domain "$d"; then
+                echo "$d" >> "$DOMAINS"
+            else
+                warn "Skipping invalid domain: $a"
+            fi
+        done
+    fi
+    ok "domains in $DOMAINS: $(list_domains | wc -l)"
+
+    say "${CYN}[5/5] start${CLR}"
+    do_start || return 1
+    echo
+    do_status
+    echo
+    IFN=$(detect_iface)
+    if iface_up "$IFN" && iface_has_v4 "$IFN"; then
+        ok "Setup complete. Test: add ifconfig.me to the list ($NAME domain add ifconfig.me), then run curl ifconfig.me on a LAN client"
+    else
+        warn "Setup finished but the tunnel is not fully ready. Check the status output above"
+    fi
 }
 
 do_uninstall() {
@@ -752,11 +833,11 @@ do_uninstall() {
 do_cli_install() {
     load_conf
     command -v opkg > /dev/null 2>&1 || {
-        err "Entware (opkg) is required. Run amtm and install Entware first"
+        err "Entware (opkg) is required. Run amtm, use fd to format a USB drive if needed, then ep to install Entware, and re-run: $NAME setup"
         return 1
     }
-    opkg update
-    opkg install curl ca-certificates
+    opkg update || return 1
+    opkg install curl ca-certificates || return 1
     cd /opt || return 1
     curl -fsSL "$AGVPN_INSTALL_URL" -o /opt/tmp/agvpn_install.sh 2>/dev/null || curl -fsSL "$AGVPN_INSTALL_URL" -o /tmp/agvpn_install.sh || return 1
     ins=/opt/tmp/agvpn_install.sh
@@ -1160,7 +1241,9 @@ usage() {
 $NAME $VERSION - AdGuard VPN CLI with domain based routing for Asuswrt-Merlin
 
 Service:
-  install | uninstall | start | stop | restart | status | menu | version
+  install [--no-setup]     install add-on, then guided setup (CLI, login, location, domains, start)
+  setup                    re-run guided setup (resumes where needed)
+  uninstall | start | stop | restart | status | menu | version
   cli-install              install adguardvpn-cli through Entware
   self-update              fetch new script from update_url
 Allow list:
@@ -1189,7 +1272,11 @@ main() {
     cmd="$1"
     [ $# -gt 0 ] && shift
     case "$cmd" in
-        install) do_install ;;
+        install)
+            do_install || return 1
+            [ "$1" = "--no-setup" ] || do_setup
+            ;;
+        setup) do_setup ;;
         uninstall) do_uninstall ;;
         start)
             do_start
