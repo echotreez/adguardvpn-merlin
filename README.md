@@ -10,6 +10,7 @@
 - AdGuard CLI 固定为 `TUN` + `tun-routing-mode NONE` + `change-system-dns off`，不碰默认路由和 resolv.conf
 - IPv6：默认 `block`（对白名单域名的 AAAA 目的地 REJECT，客户端回退 IPv4，避免泄漏）
 - 可选 kill switch：tunnel 断开时白名单流量直接丢弃，不走 WAN
+- `tun0` 的 `rp_filter` 必须是 `2`（loose）：回包从 tun0 进来，而反向路由查询走的是主表（WAN），strict 模式会把回包丢掉。CLI 每次重建 `tun0` 都会把它重置成默认值，所以 watchdog 和 `fw`（firewall-start / nat-start）都会检查并自动修复，并写入系统日志
 
 ## 安装
 
@@ -147,7 +148,7 @@ adguardvpn test netflix.com
 
 ## 需要实机确认的点
 
-1. `tun0` 在 NONE 模式下是否有 IPv4 地址（MASQUERADE 需要）。AdGuard 文档没有明确说明。检查 `ip -4 addr show tun0`；如果没有 `inet`，把 `ip addr show tun0`、`adguardvpn-cli config show`、`/tmp/adguardvpn_connect.log` 的输出发回来再定方案。
+1. `tun0` 在 NONE 模式下会拿到一个 `/32` 的 IPv4 地址（MASQUERADE 需要），已在实机验证。可用 `ip -4 addr show tun0` 确认；如果没有 `inet`，把 `ip addr show tun0`、`adguardvpn-cli config show`、`/tmp/adguardvpn_connect.log` 的输出发出来再定方案。
 2. fwmark `0x2000000` 是否与你的 VPN Director / QoS 冲突：`ip rule` 和 `iptables -t mangle -S` 里查；冲突就 `adguardvpn set mark 0x...` 和 `set mask 0x...`。
 3. 客户端必须使用路由器的 dnsmasq 解析。浏览器 DoH、写死 DNS、AdGuardHome 接管 53 端口都会让 ipset 为空；用 DNS Director 强制重定向。
 4. 白名单要覆盖站点用到的所有域名（CDN、API 域名）；用 `adguardvpn test <domain>` 逐个确认。

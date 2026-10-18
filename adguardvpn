@@ -2,7 +2,7 @@
 PATH="/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 export PATH
 NAME="adguardvpn"
-VERSION="1.0.0"
+VERSION="1.0.1"
 SCRIPT_PATH="/jffs/scripts/$NAME"
 ADDON_DIR="/jffs/addons/${NAME}.d"
 CONF="$ADDON_DIR/${NAME}.conf"
@@ -138,9 +138,9 @@ cli_cfg() {
 
 cfg_ok() {
     cc=$(cli_cfg)
-    echo "$cc" | grep -qiE 'Tunnel routing mode: *none' || return 1
-    echo "$cc" | grep -qiE 'Set system DNS: *off' || return 1
-    echo "$cc" | grep -qiE '^ *Mode: *tun' || return 1
+    echo "$cc" | grep -qiE 'Tunnel routing mode:[[:space:]]*none' || return 1
+    echo "$cc" | grep -qiE '(Change|Set) system DNS:[[:space:]]*off' || return 1
+    echo "$cc" | grep -qiE '^[[:space:]]*Mode:[[:space:]]*tun' || return 1
     return 0
 }
 
@@ -150,7 +150,7 @@ enforce_cli_config() {
     agcli config set-change-system-dns off > /dev/null 2>&1
     agcli config set-show-hints off > /dev/null 2>&1
     agcli config set-show-notifications off > /dev/null 2>&1
-    cfg_ok || warn "Could not confirm CLI config (need: Mode tun, Tunnel routing mode none, Set system DNS off). Check: $NAME cli config show"
+    cfg_ok || warn "Could not confirm CLI config (need: Mode tun, Tunnel routing mode none, Change system DNS off). Check: $NAME cli config show"
     return 0
 }
 
@@ -379,7 +379,26 @@ fw_apply_locked() {
 }
 
 fw_check() {
-    iptables -t mangle -S "$CH_MARK" > /dev/null 2>&1 && iptables -t nat -S "$CH_NAT" > /dev/null 2>&1 && iptables -t filter -S "$CH_FWD" > /dev/null 2>&1
+    iptables -t mangle -S "$CH_MARK" > /dev/null 2>&1 || return 1
+    iptables -t nat -S "$CH_NAT" > /dev/null 2>&1 || return 1
+    iptables -t filter -S "$CH_FWD" > /dev/null 2>&1 || return 1
+    iptables -t mangle -C PREROUTING -i "$AGVPN_LAN" -j "$CH_MARK" > /dev/null 2>&1 || return 1
+    iptables -t mangle -C FORWARD -j "$CH_MSS" > /dev/null 2>&1 || return 1
+    iptables -t filter -C FORWARD -j "$CH_FWD" > /dev/null 2>&1 || return 1
+    iptables -t nat -C POSTROUTING -o "$(detect_iface)" -j "$CH_NAT" > /dev/null 2>&1 || return 1
+    return 0
+}
+
+rpf_ok() {
+    [ "$(cat "/proc/sys/net/ipv4/conf/$1/rp_filter" 2>/dev/null)" = "2" ]
+}
+
+rpf_set() {
+    iface_up "$1" || return 0
+    rpf_ok "$1" && return 0
+    echo 2 > "/proc/sys/net/ipv4/conf/$1/rp_filter" 2>/dev/null
+    log "rp_filter on $1 was not 2 (CLI recreated the interface?), set to 2"
+    return 0
 }
 
 rt_strip() {
@@ -424,7 +443,7 @@ rt_apply() {
     ip rule add fwmark "$AGVPN_MARK/$AGVPN_MASK" lookup "$AGVPN_TABLE" priority "$AGVPN_PRIO"
     if [ -n "$IFN" ] && iface_up "$IFN"; then
         ip route add default dev "$IFN" table "$AGVPN_TABLE" metric 10
-        echo 2 > "/proc/sys/net/ipv4/conf/$IFN/rp_filter" 2>/dev/null
+        rpf_set "$IFN"
     fi
     if [ "$AGVPN_KILLSWITCH" = "1" ]; then
         ip route add blackhole default table "$AGVPN_TABLE" metric 100
@@ -439,6 +458,7 @@ rt_check() {
     rt_hijacked && return 1
     if [ -n "$IFN" ] && iface_up "$IFN"; then
         ip route show table "$AGVPN_TABLE" 2>/dev/null | grep -q "default dev $IFN" || return 1
+        rpf_ok "$IFN" || return 1
     fi
     return 0
 }
@@ -825,7 +845,7 @@ hook_add() {
     } > "$hf.tmp"
     cat "$hf.tmp" > "$hf"
     rm -f "$hf.tmp"
-    chmod a+rx "$hf"
+    chmod 755 "$hf"
 }
 
 hook_conflicts() {
@@ -857,7 +877,7 @@ do_install() {
     if [ "$self" != "$SCRIPT_PATH" ]; then
         cp "$0" "$SCRIPT_PATH" || return 1
     fi
-    chmod a+rx "$SCRIPT_PATH"
+    chmod 755 "$SCRIPT_PATH"
     [ -d /opt/bin ] && ln -sf "$SCRIPT_PATH" /opt/bin/$NAME
     [ -f "$CONF" ] || : > "$CONF"
     [ -f "$DOMAINS" ] || printf '# one domain per line; subdomains are included automatically\n' > "$DOMAINS"
@@ -1216,7 +1236,7 @@ cmd_self_update() {
         return 1
     }
     cp /tmp/${NAME}.new "$SCRIPT_PATH"
-    chmod a+rx "$SCRIPT_PATH"
+    chmod 755 "$SCRIPT_PATH"
     rm -f /tmp/${NAME}.new
     hooks_install
     ok "Updated"
