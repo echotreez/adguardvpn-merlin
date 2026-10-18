@@ -13,10 +13,10 @@
 
 ## 安装
 
-在 client 上：
+在客户端（下载了脚本的电脑）上，进入脚本所在目录后运行：
 
 ```sh
-scp ~/adguardvpn admin@<router-ip>:/jffs/scripts/adguardvpn
+scp adguardvpn admin@<router-ip>:/jffs/scripts/adguardvpn
 ```
 
 在 router 上（SSH）：
@@ -32,6 +32,57 @@ adguardvpn start
 ```
 
 前提：Administration → System 里启用 JFFS custom scripts、SSH；已装 Entware（amtm → `ep`）。
+
+## 白名单（allow list）
+
+`install` 会自动在 `/jffs/addons/adguardvpn.d/` 下生成以下文件，可以直接用 `vi` 手动编辑：
+
+| 文件 | 作用 | 初始内容 |
+|---|---|---|
+| `domains.list` | 走 VPN 的域名白名单（核心文件） | 一行注释 |
+| `ips.list` | 可选：固定 IPv4 / CIDR，不依赖 DNS，直接走 VPN | 一行注释 |
+| `sources.list` | 可选：限定哪些 LAN 客户端参与分流，留空 = 全部 LAN 设备 | 一行注释 |
+| `adguardvpn.conf` | 设置（`adguardvpn set` 写入），初始为空，使用默认值 | 空 |
+| `enabled` | 服务开关标记，`start` 创建、`stop` 删除 | `start` 后才出现 |
+
+### domains.list 格式
+
+每行一个域名，`#` 之后是注释。子域名自动包含：写 `netflix.com` 同时覆盖 `www.netflix.com`、`api.netflix.com` 等。
+
+```
+# streaming
+netflix.com
+nflxvideo.net
+
+openai.com   # 行内注释
+https://www.github.com/foo   # 带协议或路径会自动取域名
+*.example.org                # 开头的 *. 会自动去掉
+```
+
+- 大小写不敏感，统一转小写
+- 不合法的行（如没有点的 `foo`）被忽略，重复项自动去重
+- 只写主站域名通常不够，CDN / API 域名也要加（如 Netflix 的 `nflxvideo.net`），加完用 `adguardvpn test <域名>` 检查
+
+### ips.list / sources.list 格式
+
+每行一个 IPv4 地址或 CIDR，`#` 为注释，不支持 IPv6。
+
+```
+# ips.list
+1.2.3.0/24
+8.8.8.8
+
+# sources.list
+192.168.50.0/24
+192.168.50.20
+```
+
+### 修改后如何生效
+
+- 推荐用命令，会自动重启 dnsmasq 并预热：
+  `adguardvpn domain add|remove|list|clear|import FILE|edit`、`adguardvpn ip add|remove|list`、`adguardvpn src add|remove|list`
+- 手动编辑 `domains.list` 后必须执行 `adguardvpn reload`（dnsmasq 重启后才会读到新域名）
+- 手动编辑 `ips.list` / `sources.list` 后执行 `adguardvpn restart`
 
 ## 命令
 
