@@ -19,7 +19,14 @@
 curl -fsSL https://raw.githubusercontent.com/echotreez/adguardvpn-merlin/main/adguardvpn -o /jffs/scripts/adguardvpn && chmod a+rx /jffs/scripts/adguardvpn && /jffs/scripts/adguardvpn install
 ```
 
-或者手动：在客户端（下载了脚本的电脑）上进入脚本所在目录运行 `scp adguardvpn admin@<router-ip>:/jffs/scripts/adguardvpn`，再在 router 上：
+或者手动：在客户端（下载了脚本的电脑）上进入脚本所在目录运行下面任一命令（Merlin 的 dropbear 没有 sftp-server，所以 scp 要加 `-O` 强制走旧协议）：
+
+```sh
+scp -O adguardvpn admin@<router-ip>:/jffs/scripts/adguardvpn
+ssh admin@<router-ip> "cat > /jffs/scripts/adguardvpn" < adguardvpn
+```
+
+再在 router 上：
 
 ```sh
 chmod a+rx /jffs/scripts/adguardvpn
