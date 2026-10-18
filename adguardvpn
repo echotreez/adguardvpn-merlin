@@ -53,7 +53,7 @@ load_conf() {
     AGVPN_TIMEOUT="86400"
     AGVPN_WATCHDOG="1"
     AGVPN_INSTALL_URL="$INSTALL_URL_DEFAULT"
-    AGVPN_UPDATE_URL=""
+    AGVPN_UPDATE_URL="https://raw.githubusercontent.com/echotreez/adguardvpn-merlin/main/adguardvpn"
     [ -f "$CONF" ] && . "$CONF"
     return 0
 }

@@ -13,13 +13,13 @@
 
 ## 安装
 
-在客户端（下载了脚本的电脑）上，进入脚本所在目录后运行：
+在 router 上通过 SSH 运行一条命令（推荐）：
 
 ```sh
-scp adguardvpn admin@<router-ip>:/jffs/scripts/adguardvpn
+curl -fsSL https://raw.githubusercontent.com/echotreez/adguardvpn-merlin/main/adguardvpn -o /jffs/scripts/adguardvpn && chmod a+rx /jffs/scripts/adguardvpn && /jffs/scripts/adguardvpn install
 ```
 
-在 router 上（SSH）：
+或者手动：在客户端（下载了脚本的电脑）上进入脚本所在目录运行 `scp adguardvpn admin@<router-ip>:/jffs/scripts/adguardvpn`，再在 router 上：
 
 ```sh
 chmod a+rx /jffs/scripts/adguardvpn
@@ -27,6 +27,8 @@ chmod a+rx /jffs/scripts/adguardvpn
 ```
 
 `install` 会按顺序完成整个流程：检查环境、安装 hook、通过 Entware 安装 adguardvpn-cli、登录、选择 location、录入初始域名、启动隧道并输出状态。中途失败后可随时重新运行 `adguardvpn setup` 继续。只想安装 add-on 本身用 `adguardvpn install --no-setup`。
+
+升级：`adguardvpn self-update`（从本仓库 main 分支拉取并做语法检查后替换）。
 
 前提：Administration → System 里启用 JFFS custom scripts、SSH；已装 Entware（amtm → `ep`）。
 
