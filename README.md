@@ -90,14 +90,40 @@ https://www.github.com/foo   # 带协议或路径会自动取域名
 - 手动编辑 `domains.list` 后必须执行 `adguardvpn reload`（dnsmasq 重启后才会读到新域名）
 - 手动编辑 `ips.list` / `sources.list` 后执行 `adguardvpn restart`
 
+## AdGuard CLI 连接时的两个提示
+
+官方 Merlin 教程是为“整个路由器全部流量走 VPN”设计的，和本 add-on 的目标相反：
+
+| 提示 | 官方教程的答案 | 实际效果 | 本 add-on 的做法 |
+|---|---|---|---|
+| `Would you like to set default routes in TUN mode?` | yes | `Tunnel routing mode: auto`，CLI 往路由表写默认路由，LAN 所有流量都被劫持进隧道 | 固定为 `none`：只建 tun 接口，不动路由表；分流由 ipset + fwmark + `ip rule` 完成 |
+| `Would you allow AdGuard VPN to set system DNS?` | 教程未提及（常见做法 no） | `Set system DNS: on` 时 CLI 会改系统 DNS，可能覆盖路由器 dnsmasq 的上游 | 固定为 `off`：路由器 DNS 保持原样，dnsmasq 才能把白名单域名解析结果写入 ipset |
+
+注意：`connect -y` 会对所有提示自动回答 yes，等于选了 auto。脚本因此不再使用 `-y`，连接前先把配置设成 `none/off`，并用 `config show` 校验，不符合就断开重连。连接后还会清理 CLI 可能写进主路由表的 `0.0.0.0/1`、`128.0.0.0/1` 劫持路由。
+
+不要手工用官方教程的方式 `connect`（回答 yes），否则会变成全局 VPN。
+
+## IPv6（例如 tunnelbroker 的 6in4 隧道）
+
+路由器有 IPv6 时，浏览器会优先用 AAAA，直接走 IPv6 隧道，绕过 VPN。默认 `ipv6=block`：
+
+- dnsmasq 把白名单域名的 AAAA 地址写入 `AGVPN_DOM6`
+- ip6tables 在 FORWARD 里对这些地址 REJECT，客户端立刻回退到 IPv4，走 VPN
+- 用 `adguardvpn test <域名>` 检查：应显示 AAAA 地址在 `AGVPN_DOM6` 里，且提示 “IPv6 to this domain is rejected”
+- 局限：客户端要先解析过域名（地址进了 set）才会被拦；首次连接可能有一个短暂回退过程。客户端用 DoH 或写死 DNS 时 set 为空，IPv4 和 IPv6 都会绕过（用 DNS Director 强制走路由器 dnsmasq）
+
+## 排障：`adguardvpn doctor`
+
+一条命令输出所有关键信息：CLI 配置、tun 接口地址、主路由表里 tun0 的残留路由、`ip rule`、table 内容、各条 iptables/ip6tables 链、ipset 条目数、dnsmasq 规则数、`resolv.conf`、路由器自身经 WAN 与经 tun0 的出口 IP。分流不生效时把输出贴出来即可定位。
+
 ## 命令
 
 | 类别 | 命令 |
 |---|---|
 | 服务 | `install` `uninstall` `start` `stop` `restart` `status` `menu` `cli-install` `self-update` |
-| 白名单 | `domain add/remove/list/clear/import/edit` `ip add/remove/list` `src add/remove/list` `reload` `warm` `test DOMAIN` |
+| 白名单 | `domain add/remove/list/clear/import/edit` `ip add/remove/list` `src add/remove/list` `reload` `warm` `test DOMAIN` `doctor` |
 | 设置 | `set [name value]`：iface table prio mark mask lan killswitch ipv6 dns home cli location fastest iponly timeout watchdog |
-| CLI 对应 | `login` `logout` `license` `status` `list-locations [n]` `connect [-l LOC｜-f] [-4｜-6] [-y] [-v]` `disconnect` `config <sub>` `site-exclusions <sub>` `check-update` `update [-y] [-v]` `export-logs [-o] [-f]` `cli <任意参数>` |
+| CLI 对应 | `login` `logout` `license` `status` `list-locations [n]` `connect [-l LOC｜-f] [-4｜-6] [-v]`（`-y` 被忽略） `disconnect` `config <sub>` `site-exclusions <sub>` `check-update` `update [-y] [-v]` `export-logs [-o] [-f]` `cli <任意参数>` |
 
 无参数运行进入 amtm 风格菜单。`config set-tun-routing-mode` 非 NONE、`set-change-system-dns on`、`set-mode SOCKS` 会被拒绝（`AGVPN_FORCE=1` 可强制）。
 

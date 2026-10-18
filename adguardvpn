@@ -132,12 +132,25 @@ agcli() {
     "$cb" "$@"
 }
 
+cli_cfg() {
+    agcli config show 2>&1
+}
+
+cfg_ok() {
+    cc=$(cli_cfg)
+    echo "$cc" | grep -qiE 'Tunnel routing mode: *none' || return 1
+    echo "$cc" | grep -qiE 'Set system DNS: *off' || return 1
+    echo "$cc" | grep -qiE '^ *Mode: *tun' || return 1
+    return 0
+}
+
 enforce_cli_config() {
     agcli config set-mode TUN > /dev/null 2>&1
     agcli config set-tun-routing-mode NONE > /dev/null 2>&1
     agcli config set-change-system-dns off > /dev/null 2>&1
     agcli config set-show-hints off > /dev/null 2>&1
     agcli config set-show-notifications off > /dev/null 2>&1
+    cfg_ok || warn "Could not confirm CLI config (need: Mode tun, Tunnel routing mode none, Set system DNS off). Check: $NAME cli config show"
     return 0
 }
 
@@ -369,6 +382,29 @@ fw_check() {
     iptables -t mangle -S "$CH_MARK" > /dev/null 2>&1 && iptables -t nat -S "$CH_NAT" > /dev/null 2>&1 && iptables -t filter -S "$CH_FWD" > /dev/null 2>&1
 }
 
+rt_strip() {
+    IFS_N=$(detect_iface)
+    [ -n "$IFS_N" ] || return 0
+    for d in $(ip -4 route show dev "$IFS_N" 2>/dev/null | awk '$1=="0.0.0.0/1"||$1=="128.0.0.0/1"{print $1}'); do
+        ip -4 route del "$d" dev "$IFS_N" 2>/dev/null
+    done
+    if ip -4 route show default 2>/dev/null | grep -v "dev $IFS_N" | grep -q default; then
+        ip -4 route del default dev "$IFS_N" 2>/dev/null
+    fi
+    for d in $(ip -6 route show dev "$IFS_N" 2>/dev/null | awk '$1=="::/1"||$1=="8000::/1"{print $1}'); do
+        ip -6 route del "$d" dev "$IFS_N" 2>/dev/null
+    done
+    return 0
+}
+
+rt_hijacked() {
+    IFS_N=$(detect_iface)
+    [ -n "$IFS_N" ] || return 1
+    ip -4 route show dev "$IFS_N" 2>/dev/null | grep -qE '^(0\.0\.0\.0/1|128\.0\.0\.0/1)' && return 0
+    ip -4 route show default 2>/dev/null | grep -q "dev $IFS_N" && ip -4 route show default 2>/dev/null | grep -v "dev $IFS_N" | grep -q default && return 0
+    return 1
+}
+
 rt_remove() {
     load_conf
     for p in $(ip rule show 2>/dev/null | awk -v t="$AGVPN_TABLE" '$NF == t {sub(":", "", $1); print $1}'); do
@@ -384,6 +420,7 @@ rt_apply() {
     [ -f "$STATE" ] || return 0
     IFN=$(detect_iface)
     rt_remove
+    rt_strip
     ip rule add fwmark "$AGVPN_MARK/$AGVPN_MASK" lookup "$AGVPN_TABLE" priority "$AGVPN_PRIO"
     if [ -n "$IFN" ] && iface_up "$IFN"; then
         ip route add default dev "$IFN" table "$AGVPN_TABLE" metric 10
@@ -399,6 +436,7 @@ rt_apply() {
 rt_check() {
     IFN=$(detect_iface)
     ip rule show 2>/dev/null | grep -q "lookup $AGVPN_TABLE\$" || return 1
+    rt_hijacked && return 1
     if [ -n "$IFN" ] && iface_up "$IFN"; then
         ip route show table "$AGVPN_TABLE" 2>/dev/null | grep -q "default dev $IFN" || return 1
     fi
@@ -425,7 +463,7 @@ iface_ready() {
 }
 
 run_connect() {
-    set -- connect -y
+    set -- connect
     if [ -n "$AGVPN_LOCATION" ]; then
         set -- "$@" -l "$AGVPN_LOCATION"
     elif [ "$AGVPN_FASTEST" = "1" ]; then
@@ -435,19 +473,24 @@ run_connect() {
         4) set -- "$@" -4 ;;
         6) set -- "$@" -6 ;;
     esac
-    agcli "$@"
+    printf 'no\nno\nno\nno\nno\n' | agcli "$@"
 }
 
 bring_up() {
-    if iface_ready; then
-        return 0
-    fi
-    date +%s > "$LASTTRY"
     cli_bin > /dev/null || {
         err "adguardvpn-cli not found. Run: $NAME cli-install"
         return 1
     }
     enforce_cli_config
+    if iface_ready; then
+        if cfg_ok; then
+            return 0
+        fi
+        warn "CLI is connected with route/DNS takeover settings; reconnecting with NONE"
+        agcli disconnect > /dev/null 2>&1
+        sleep 3
+    fi
+    date +%s > "$LASTTRY"
     ( run_connect > /tmp/${NAME}_connect.log 2>&1 & )
     n=0
     while [ "$n" -lt 40 ]; do
@@ -633,6 +676,74 @@ do_test() {
         say "$ip  [$inset]"
         say "   marked route : $via"
     done
+    test_v6 "$d"
+}
+
+test_v6() {
+    t6=$(nslookup -type=AAAA "$1" 127.0.0.1 2>/dev/null | grep -oE '([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}' | grep -v '^::1$' | sort -u)
+    if [ -z "$t6" ]; then
+        say "no AAAA record (IPv6 cannot bypass)"
+        return 0
+    fi
+    for ip6 in $t6; do
+        if ipset test "$SET_DOM6" "$ip6" > /dev/null 2>&1; then
+            iv="in ipset $SET_DOM6"
+        else
+            iv="NOT in ipset $SET_DOM6"
+        fi
+        say "$ip6  [$iv]"
+    done
+    if [ "$AGVPN_IPV6" = "block" ]; then
+        if have ip6tables && ip6tables -S "$CH_FWD6" > /dev/null 2>&1; then
+            ok "   IPv6 to this domain is rejected, clients fall back to IPv4 through the VPN"
+        else
+            err "   IPv6 block chain missing: IPv6 will bypass the VPN. Run: $NAME fw"
+        fi
+    else
+        warn "   ipv6 setting is 'ignore': IPv6 will bypass the VPN"
+    fi
+}
+
+do_doctor() {
+    load_conf
+    IFN=$(detect_iface)
+    say "${CYN}== adguardvpn-cli config${CLR}"
+    cli_cfg
+    say "${CYN}== adguardvpn-cli status${CLR}"
+    agcli status 2>&1 | head -n 20
+    say "${CYN}== interface ${IFN}${CLR}"
+    ip addr show "$IFN" 2>&1
+    say "${CYN}== main-table routes on $IFN (must be empty)${CLR}"
+    ip route show dev "$IFN" 2>&1
+    say "${CYN}== default routes${CLR}"
+    ip -4 route show default
+    ip -6 route show default 2>&1
+    say "${CYN}== ip rule / table $AGVPN_TABLE${CLR}"
+    ip rule show
+    ip route show table "$AGVPN_TABLE" 2>&1
+    say "${CYN}== iptables${CLR}"
+    iptables -t mangle -S PREROUTING | grep AGVPN
+    iptables -t mangle -S "$CH_MARK" 2>&1
+    iptables -t nat -S "$CH_NAT" 2>&1
+    iptables -t filter -S "$CH_FWD" 2>&1
+    have ip6tables && ip6tables -S "$CH_FWD6" 2>&1
+    say "${CYN}== ipsets${CLR}"
+    for st in "$SET_DOM" "$SET_DOM6" "$SET_NET"; do
+        echo "$st: $(count_set $st) entries"
+    done
+    ipset list "$SET_DOM" 2>/dev/null | sed -n '/Members/,$p' | head -n 8
+    say "${CYN}== dnsmasq${CLR}"
+    echo "agvpn lines: $(grep -c '# agvpn$' /etc/dnsmasq.conf 2>/dev/null)"
+    grep '# agvpn$' /etc/dnsmasq.conf 2>/dev/null | head -n 4
+    say "${CYN}== resolv.conf${CLR}"
+    cat /etc/resolv.conf 2>&1
+    say "${CYN}== egress${CLR}"
+    if have curl; then
+        echo "WAN : $(curl -s --max-time 8 https://api.ipify.org 2>&1)"
+        echo "$IFN: $(curl -s --max-time 8 --interface "$IFN" https://api.ipify.org 2>&1)"
+    else
+        echo "curl not found"
+    fi
 }
 
 count_set() {
@@ -1257,7 +1368,7 @@ Allow list:
   domain add|remove|list|clear|import FILE|edit
   ip add|remove|list|clear         static IPv4/CIDR routed through the VPN
   src add|remove|list|clear        limit routing to these LAN clients
-  reload | warm | test DOMAIN
+  reload | warm | test DOMAIN | doctor
   set [NAME VALUE]                 iface table prio mark mask lan killswitch ipv6 dns home cli
                                    location fastest iponly timeout watchdog install_url update_url
 adguardvpn-cli commands:
@@ -1313,6 +1424,7 @@ main() {
         reload) do_reload ;;
         warm) do_warm ;;
         test) do_test "$1" ;;
+        doctor) do_doctor ;;
         set) cmd_set "$@" ;;
         fw)
             fw_apply
