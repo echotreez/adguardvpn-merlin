@@ -82,3 +82,7 @@ adguardvpn test netflix.com
 ```sh
 adguardvpn uninstall
 ```
+
+## License
+
+MIT
