@@ -35,6 +35,13 @@ warn() { printf '%b\n' "${YLW}$*${CLR}" >&2; }
 err() { printf '%b\n' "${RED}$*${CLR}" >&2; }
 log() { logger -t "$NAME" "$*"; }
 
+have() {
+    for hd in $(echo "$PATH" | tr ':' ' '); do
+        [ -x "$hd/$1" ] && return 0
+    done
+    return 1
+}
+
 load_conf() {
     AGVPN_IFACE="tun0"
     AGVPN_TABLE="1893"
@@ -268,7 +275,7 @@ fw_remove() {
     chain_reset iptables mangle FORWARD "$CH_MSS"
     chain_reset iptables filter FORWARD "$CH_FWD"
     chain_reset iptables nat POSTROUTING "$CH_NAT"
-    if command -v ip6tables > /dev/null 2>&1; then
+    if have ip6tables; then
         chain_reset ip6tables filter FORWARD "$CH_FWD6"
     fi
     return 0
@@ -350,7 +357,7 @@ fw_apply_locked() {
     iptables -t nat -A "$CH_NAT" -j MASQUERADE
     iptables -t nat -I POSTROUTING -o "$IFN" -j "$CH_NAT"
 
-    if [ "$AGVPN_IPV6" = "block" ] && command -v ip6tables > /dev/null 2>&1 && [ -f /proc/net/if_inet6 ]; then
+    if [ "$AGVPN_IPV6" = "block" ] && have ip6tables && [ -f /proc/net/if_inet6 ]; then
         ip6tables -t filter -N "$CH_FWD6" 2>/dev/null
         ip6tables -t filter -A "$CH_FWD6" -m set --match-set "$SET_DOM6" dst -j REJECT --reject-with icmp6-adm-prohibited
         ip6tables -t filter -I FORWARD -i "$AGVPN_LAN" -j "$CH_FWD6"
@@ -399,7 +406,7 @@ rt_check() {
 }
 
 cron_add() {
-    command -v cru > /dev/null 2>&1 || return 0
+    have cru || return 0
     if [ "$AGVPN_WATCHDOG" = "1" ]; then
         cru a "$NAME" "*/1 * * * * $SCRIPT_PATH watchdog"
     else
@@ -408,7 +415,7 @@ cron_add() {
 }
 
 cron_del() {
-    command -v cru > /dev/null 2>&1 && cru d "$NAME" 2>/dev/null
+    have cru && cru d "$NAME" 2>/dev/null
     return 0
 }
 
@@ -672,7 +679,7 @@ check_env() {
     if ps w 2>/dev/null | grep -i '[A]dGuardHome' > /dev/null; then
         warn "AdGuardHome appears to be running; clients must resolve through dnsmasq or the ipset stays empty"
     fi
-    if [ ! -x /usr/sbin/ipset ] && ! command -v ipset > /dev/null 2>&1; then
+    if [ ! -x /usr/sbin/ipset ] && ! have ipset; then
         err "ipset binary not found"
         return 1
     fi
@@ -832,7 +839,7 @@ do_uninstall() {
 
 do_cli_install() {
     load_conf
-    command -v opkg > /dev/null 2>&1 || {
+    have opkg || {
         err "Entware (opkg) is required. Run amtm, use fd to format a USB drive if needed, then ep to install Entware, and re-run: $NAME setup"
         return 1
     }
